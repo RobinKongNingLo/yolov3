@@ -14,6 +14,8 @@ import pickle as pkl
 import pandas as pd
 import random
 
+from terminaltables import AsciiTable
+
 def arg_parse():
 
     '''
@@ -26,7 +28,7 @@ def arg_parse():
 
     parser.add_argument('--images', dest = 'images', help =
                         'Image / Directory containing images to perform detection upon',
-                        default = 'images', type = str)
+                        default = 'images/val20142', type = str)
     parser.add_argument('--det', dest = 'det', help =
                         'Image / Directory to store detections to',
                         default = "det", type = str)
@@ -72,6 +74,18 @@ if CUDA:
 
 model.eval() #Set to evaluation mode, dropout and BN are different during evaluation and training
 
+data_cfg = parse_data_config('config/coco.data')
+valid_path = data_cfg['valid']
+precision, recall, AP, f1, ap_class = evaluate(
+    model, path = valid_path, iou_thres = 0.5, conf_thres = 0.5,
+    nms_thres = 0.5, image_size = 416, batch_size = 8, num_classes = 80)
+
+ap_table = [['Index', 'Class name', 'AP']]
+for i, c in enumerate(ap_class):
+    ap_table += [[c, classes[c], '%.5f' % AP[i]]]
+print(AsciiTable(ap_table).table)
+print(f'---- mAP {AP.mean()}')
+
 read_dir = time.time()
 
 try:
@@ -90,12 +104,10 @@ if not os.path.exists(args.det): #If the directory defined by det does not exits
 
 load_batch = time.time()
 loaded_ims = [cv2.imread(x) for x in imlist]
-print(imlist)
 
 #loaded_ims is the list consists of all the images
 #e.g. inp_dim = 3, len(imlist) = 5, [inp_dim for x in range(len(imlist))] = [3, 3, 3, 3, 3]
 #map((prep_image, loaded_ims, [inp_dim for x in range(len(imlist))])) performs prep_image() on every elements in loaded_ims
-print(loaded_ims)
 im_batches = list(map(prep_image, loaded_ims, [input_dim for x in range(len(imlist))]))
 im_dim_list = [(x.shape[1], x.shape[0]) for x in loaded_ims] #A list of sizes of the original Images
 im_dim_list = torch.FloatTensor(im_dim_list).repeat(1,2) #Transform im_dim_list from list [(W, H)] into FloatTensor [[W, H, W, H]], used to scale ((x1, y1, x2, y2)) later
@@ -209,13 +221,11 @@ def write(x, images):
     cv2.putText(img, label, (c1[0], c1[1] + t_size[1] +4), cv2.FONT_HERSHEY_PLAIN, 1, [225,255,255], 1)
     return img
 
+print('output:', output)
 list(map(lambda x: write(x, loaded_ims), output))
 #lambda x: a row of output (a bounding box), run write(x, loaded_ims) on each bounding box, draw bounding boxes on original images
-print(args.det)
-print(imlist)
 det_names = pd.Series(imlist).apply(lambda x: "{}/det_{}".format(args.det,x.split("\\")[-1]))
 #Create a list of addresses, to which we will save detection images to
-print(det_names)
 list(map(cv2.imwrite, det_names, loaded_ims))
 #Write the images with detections to the address in det_names
 end = time.time()

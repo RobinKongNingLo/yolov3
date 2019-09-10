@@ -10,13 +10,11 @@ from util import *
 def get_test_input():
     img = cv2.imread('dog-cycle-car.png')
     img = cv2.resize(img, (416, 416))
-    print(img.shape)
     img_new = img[:,:,::-1]
     #::-1 means take everything in dim 2 but backwards, which is changing BGR to RGB.
     #OpenCV loads image with BGR as the order, PyTorch loads image with RGB as the order
     img_new = img_new.transpose((2,0,1))
     #img:(H, W, C) img_new:(C, H, W)
-    print(img_new.shape)
     img_new = img_new[np.newaxis,:,:,:]/255.0
     img_new = torch.from_numpy(img_new).float()
     img_new = Variable(img_new)
@@ -58,9 +56,108 @@ in the foward function.
 
 #Define a detection layer to hold the anchors used to detect bounding boxes
 class DetectionLayer(nn.Module):
+
     def __init__(self, anchors):
         super(DetectionLayer, self).__init__()
         self.anchors = anchors
+        self.MSELoss = nn.MSELoss()
+        self.BCELoss = nn.BCELoss()
+
+    def forward(self, prediction, input_dim, num_classes, targets, ignore_thres):
+        """
+        prediction: 4-D tensor (batch_size, box_para*num_anchors, grid_size, grid_size)
+        Turns an detection feature map into a 3-D tensor, (batch_size, num_anchors*grid_size*grid_size, num_classes + 5)
+        each row in each image corresponds to a bounding box:
+        [[1st box at (0,0)],
+         [2nd box at (0,0)],
+         [3rd box at (0,0)],
+         [1st box at (0,1)],
+         ......
+         [1st box at (5,0)],
+         ......             ]
+        each box has num_classes+5 parameters(tx, ty, tw, th, confidence + probability of num_classes classes)
+        """
+        FloatTensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
+
+        batch_size = prediction.size(0)
+        grid_size = prediction.size(2)
+        stride = input_dim // grid_size
+        box_para = 5 + num_classes
+        num_anchors = len(self.anchors)
+        #The sizes of anchors defined in cfg are with respect to the size of input image, we need to change the
+        #size of anchors with respect to the size of feature map
+        scaled_anchors = FloatTensor([(a[0]/stride, a[1]/stride) for a in self.anchors])
+        anchor_w = scaled_anchors[:, 0].view((1, num_anchors, 1, 1))
+        anchor_h = scaled_anchors[:, 1].view((1, num_anchors, 1, 1))
+
+        prediction = (
+            prediction.view(batch_size, num_anchors, box_para, grid_size, grid_size)
+            .permute(0, 1, 3, 4, 2).contiguous())
+        #prediction: (batch_size, num_anchors, grid_size, grid_size, num_classes + 5)
+        #If no .contiguous(), cannot do .view()
+        #Apply sigmoid function on t_x, t_y and confidence in each bounding box
+        x = torch.sigmoid(prediction[...,0])
+        y = torch.sigmoid(prediction[...,1])
+        w = prediction[...,2]
+        h = prediction[...,3]
+        pred_conf = torch.sigmoid(prediction[...,4])
+        pred_cls = torch.sigmoid((prediction[...,5:5+num_classes]))
+        """
+        e.g. grid_size = 5
+        grid_x = [[[[0 1 ... 4]            grid_y = [[[[0 0 0 0 0]
+                    [0 1 ... 4]                        [1 1 1 1 1]
+                     .........                          .........
+                    [0 1 ... 4]]]](5 rows)             [4 4 4 4 4]]]]
+        """
+        grid_x = torch.arange(grid_size).repeat(grid_size, 1).view([1, 1, grid_size, grid_size]).type(FloatTensor)
+        grid_y = torch.arange(grid_size).repeat(grid_size, 1).t().view([1, 1, grid_size, grid_size]).type(FloatTensor)
+
+        #pred_boxes: (batch_size, num_anchors, grid_size, grid_size, 4) the last dim is [x, y, w, h]
+        pred_boxes = FloatTensor(prediction[..., :4].shape)
+        '''
+        e.g. pred_boxes[..., 0]:
+        [[image1, 1st box:
+          [[x at (0,0), x at (0,1), x at (0,2), ... x at (0,4)],
+           [x at (1,0), x at (1,1), x at (1,2), ... x at (1,4)],
+           .......
+           [x at (4,0), x at (4,1), x at (4,2), ... x at (4,4)]],
+          image1, 2nd box:
+           .......]]
+        '''
+        pred_boxes[..., 0] = x.data + grid_x
+        pred_boxes[..., 1] = y.data + grid_y
+        pred_boxes[..., 2] = torch.exp(w.data) * anchor_w
+        pred_boxes[..., 3] = torch.exp(h.data) * anchor_h
+
+        #* stride: Resize the detection map to the size of input image
+        output = torch.cat((pred_boxes.view(batch_size, -1, 4) * stride,
+                            pred_conf.view(batch_size, -1, 1),
+                            pred_cls.view(batch_size, -1, num_classes), ), -1,)
+
+        if targets is None:
+            return output, 0
+        else:
+            #Compute loss, pred_boxes: x, y, w, h
+            iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf = build_targets(
+                    pred_boxes=pred_boxes,
+                    pred_cls=pred_cls,
+                    target=targets,
+                    anchors=scaled_anchors,
+                    ignore_thres=ignore_thres,
+            )
+
+            #Mask outputs to ignore non-existing objects
+            loss_x = self.MSELoss(x[obj_mask], tx[obj_mask])
+            loss_y = self.MSELoss(y[obj_mask], ty[obj_mask])
+            loss_w = self.MSELoss(w[obj_mask], tw[obj_mask])
+            loss_h = self.MSELoss(h[obj_mask], th[obj_mask])
+            loss_conf_obj = self.BCELoss(pred_conf[obj_mask], tconf[obj_mask])
+            loss_conf_noobj = self.BCELoss(pred_conf[noobj_mask], tconf[noobj_mask])
+            loss_conf = loss_conf_obj + 100 * loss_conf_noobj
+            loss_cls = self.BCELoss(pred_cls[obj_mask], tcls[obj_mask])
+            total_loss = loss_x + loss_y + loss_w + loss_h + loss_conf + loss_cls
+
+            return output, total_loss
 
 def create_modules(blocks):
 
@@ -71,7 +168,7 @@ def create_modules(blocks):
 
     for i, block in enumerate(blocks[1:]):
 
-        module = nn.Sequential() #A block may contain more than one layer
+        modules = nn.Sequential() #A block may contain more than one layer
 
         if block['type'] == 'convolutional':
 
@@ -94,20 +191,20 @@ def create_modules(blocks):
                 pad = 0
 
             conv = nn.Conv2d(prev_filters, filters, kernel_size, stride, pad, bias = bias)
-            module.add_module('conv_' + str(i), conv) #e.g. add module conv_1
+            modules.add_module('conv_' + str(i), conv) #e.g. add module conv_1
 
             if batch_normalize:
                 bn = nn.BatchNorm2d(filters)
-                module.add_module('batch_norm_' + str(i), bn)
+                modules.add_module('batch_norm_' + str(i), bn)
 
             if activation == 'leaky':
                 act = nn.LeakyReLU(0.1, inplace = True)
-                module.add_module('leaky_' + str(i), act)
+                modules.add_module('leaky_' + str(i), act)
 
         elif block['type'] == 'upsample':
             stride = int(block['stride'])
             ups = nn.Upsample(scale_factor = stride, mode = 'nearest')
-            module.add_module('upsample_' + str(i), ups)
+            modules.add_module('upsample_' + str(i), ups)
 
         elif block['type'] == 'route':
             """
@@ -138,7 +235,7 @@ def create_modules(blocks):
                 end = i + end
 
             route = EmptyLayer()
-            module.add_module("route_" + str(i), route)
+            modules.add_module("route_" + str(i), route)
 
             if end == 0:
                 filters = output_filters[start]
@@ -147,7 +244,7 @@ def create_modules(blocks):
 
         elif block['type'] == 'shortcut':
             shortcut = EmptyLayer()
-            module.add_module('shortcut_' + str(i), shortcut)
+            modules.add_module('shortcut_' + str(i), shortcut)
 
         elif block['type'] == 'yolo':
             mask = block['mask'].split(',')
@@ -161,9 +258,9 @@ def create_modules(blocks):
             anchors = [anchors[n] for n in mask]
 
             detection = DetectionLayer(anchors)
-            module.add_module('Detection_' + str(i), detection)
+            modules.add_module('Detection_' + str(i), detection)
 
-        module_list.append(module)
+        module_list.append(modules)
         prev_filters = filters
         output_filters.append(filters)
 
@@ -177,20 +274,20 @@ class Darknet(nn.Module):
         self.net_info, self.module_list = create_modules(self.blocks)
 
     def forward(self, x, targets = None):
-        print('darknet targets: ', targets)
-        modules = self.blocks[1 : ]
+        blocks = self.blocks[1 : ]
+        modules = self.module_list
         outputs = {}
         #A dictionary contains output feature maps of every route and shortut layers.
         #key: index of layer, value: feature maps
         detected = 0 #detected=0 means have not made yolo detection yet
         loss = 0
-        for i, module in enumerate(modules):
+        for i, (block, module) in enumerate(zip(blocks, modules)):
 
-            if module['type'] == 'convolutional' or module['type'] == 'upsample':
+            if block['type'] == 'convolutional' or block['type'] == 'upsample':
                 x = self.module_list[i](x)
 
-            elif module['type'] == 'route':
-                layers = module['layers'].split(',')
+            elif block['type'] == 'route':
+                layers = block['layers'].split(',')
                 start = int(layers[0])
 
                 try:
@@ -211,17 +308,15 @@ class Darknet(nn.Module):
                     cat2 = outputs[end]
                     x = torch.cat((cat1, cat2), 1)
 
-            elif module['type'] == 'shortcut':
-                start = int(module['from'])
+            elif block['type'] == 'shortcut':
+                start = int(block['from'])
                 x = outputs[i - 1] + outputs[i + start]
 
-            elif module['type'] == 'yolo':
-                anchors = self.module_list[i][0].anchors
+            elif block['type'] == 'yolo':
                 input_dim = int(self.net_info['height'])
-                num_classes = int(module['classes'])
-                x = x.data #Change x into Tensor
+                num_classes = int(block['classes'])
                 #x: (batch_size, box_para(5 + classes)*num_anchors, grid_size, grid_size)
-                x, layer_loss = predict_transform_loss(x, input_dim, anchors, num_classes, targets, ignore_thres = 0.5)
+                x, layer_loss = module[0](x, input_dim, num_classes, targets, ignore_thres = 0.5)
                 loss = loss + layer_loss
 
                 if detected == 0:
@@ -232,12 +327,13 @@ class Darknet(nn.Module):
                     #detections: (batch_size, grid_size*grid_size*num_anchors*3, 5+num_classes)
 
             outputs[i] = x
-        if targets == None:
+        if targets is None:
             return detections
         else:
-            return (loss, detections)
+            return loss, detections
 
     def load_weights(self, weightfile):
+        print('weights loaded')
         fp = open(weightfile, 'rb')
         #The first 5 values are header information
         # 1. Major version number
@@ -311,7 +407,6 @@ class Darknet(nn.Module):
 
                 conv_weights = conv_weights.view_as(conv.weight.data)
                 conv.weight.data.copy_(conv_weights)
-
 
 
 

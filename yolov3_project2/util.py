@@ -14,6 +14,23 @@ import cv2
 import tqdm
 import os
 
+def to_cpu(tensor):
+    return tensor.detach().cpu()
+
+def parse_data_config(path):
+
+    options = dict()
+    options['gpus'] = '0, 1, 2, 3'
+    options['num_workers'] = '10'
+    with open(path, 'r') as fp:
+        lines = fp.readlines()
+    for line in lines:
+        line = line.strip()
+        if line == '' or line.startswith('#'): #Ignore empty line and comments
+            continue
+        key, value = line.split('=')
+        options[key.strip()] = value.strip()
+    return options
 
 def weights_init_normal(m):
     classname = m.__class__.__name__
@@ -67,6 +84,8 @@ def pad_to_square(img, pad_value):
         pad = (pad1, pad2, 0, 0)
     img = F.pad(img, pad, 'constant', value = pad_value)
 
+    return img, pad
+
 def horizontal_flip(images, targets):
     images = torch.flip(images, [-1]) #Flip images horizontally
     targets[:, 2] = 1 - targets[:, 2] #x -> 1 - x
@@ -82,7 +101,6 @@ class ListDataset(Dataset):
         self.image_size = image_size
         self.max_objects = 100
         self.augment = augment
-        self.multoscale = multiscale
         self.normalized_labels = normalized_labels
         self.min_size = self.image_size - 3 * 32
         self.max_size = self.image_size + 3 * 32
@@ -134,7 +152,7 @@ class ListDataset(Dataset):
         #Use own collate_fn to process the list of samples to form a batch, batch is a list with all the examples
         paths, images, targets = list(zip(*batch)) #Unzip paths, images, targets from __getitem__
         #Remove empty targets
-        targets = [boxes for boxes in targets if boxes if not None]
+        targets = [boxes for boxes in targets if boxes is not None]
         #Add image index to the 1st element of each row of targets
         for i, boxes in enumerate(targets):
             #boxes: a tensor consists of all the bounding boxes in ith image
@@ -171,7 +189,6 @@ def build_targets(pred_boxes, pred_cls, target, anchors, ignore_thres):
     th = FloatTensor(n_batch, n_anchor, n_grid, n_grid).fill_(0)
     tcls = FloatTensor(n_batch, n_anchor, n_grid, n_grid, n_class).fill_(0)
 
-    print('target:', target)
     target_boxes = target[:, 2:6] * n_grid
     gxy = target_boxes[:, :2]
     gwh = target_boxes[:, 2:]
@@ -200,107 +217,11 @@ def build_targets(pred_boxes, pred_cls, target, anchors, ignore_thres):
     tcls[b, best_n, gj, gi, target_labels] = 1
     #Compute label correctness and iou at best anchor
     class_mask[b, best_n, gj, gi] = (pred_cls[b, best_n, gj, gi].argmax(-1) == target_labels).float()
-    iou_scores[b, best_n, gj, gi] = bbox_iou(pred_boxes[b, best_n, gj, gi], target_boxes, x1y1x2y2=False)
+    #pred_boxes and targets are both x, y, w, h. x1y1x2y2 = False
+    iou_scores[b, best_n, gj, gi] = bbox_iou(pred_boxes[b, best_n, gj, gi], target_boxes, x1y1x2y2 = False)
 
     tconf = obj_mask.float()
     return iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf
-
-def predict_transform_loss(prediction, input_dim, anchors, num_classes, targets, ignore_thres):
-    """
-    prediction: 4-D tensor (batch_size, box_para*num_anchors, grid_size, grid_size)
-    Turns an detection feature map into a 3-D tensor, (batch_size, num_anchors*grid_size*grid_size, num_classes + 5)
-    each row in each image corresponds to a bounding box:
-    [[1st box at (0,0)],
-     [2nd box at (0,0)],
-     [3rd box at (0,0)],
-     [1st box at (0,1)],
-     ......
-     [1st box at (5,0)],
-     ......             ]
-    each box has num_classes+5 parameters(tx, ty, tw, th, confidence + probability of num_classes classes)
-    """
-    print('start predict_transform_loss, targets:', targets)
-    FloatTensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
-
-    batch_size = prediction.size(0)
-    grid_size = prediction.size(2)
-    stride = input_dim // grid_size
-    box_para = 5 + num_classes
-    num_anchors = len(anchors)
-    #The sizes of anchors defined in cfg are with respect to the size of input image, we need to change the
-    #size of anchors with respect to the size of feature map
-    scaled_anchors = FloatTensor([(a[0]/stride, a[1]/stride) for a in anchors])
-    anchor_w = scaled_anchors[:, 0].view((1, num_anchors, 1, 1))
-    anchor_h = scaled_anchors[:, 1].view((1, num_anchors, 1, 1))
-
-    prediction = (
-        prediction.view(batch_size, num_anchors, box_para, grid_size, grid_size)
-        .permute(0, 1, 3, 4, 2).contiguous())
-    #prediction: (batch_size, num_anchors, grid_size, grid_size, num_classes + 5)
-    #If no .contiguous(), cannot do .view()
-    #Apply sigmoid function on t_x, t_y and confidence in each bounding box
-    x = torch.sigmoid(prediction[...,0])
-    y = torch.sigmoid(prediction[...,1])
-    w = prediction[...,2]
-    h = prediction[...,3]
-    pred_conf = torch.sigmoid(prediction[...,4])
-    pred_cls = torch.sigmoid((prediction[...,5:5+num_classes]))
-    """
-    e.g. grid_size = 5
-    grid_x = [[[[0 1 ... 4]            grid_y = [[[[0 0 0 0 0]
-                [0 1 ... 4]                        [1 1 1 1 1]
-                 .........                          .........
-                [0 1 ... 4]]]](5 rows)             [4 4 4 4 4]]]]
-    """
-    grid_x = torch.arange(grid_size).repeat(grid_size, 1).view([1, 1, grid_size, grid_size]).type(FloatTensor)
-    grid_y = torch.arange(grid_size).repeat(grid_size, 1).t().view([1, 1, grid_size, grid_size]).type(FloatTensor)
-
-    #pred_boxes: (batch_size, num_anchors, grid_size, grid_size, 4) the last dim is [x, y, w, h]
-    pred_boxes = FloatTensor(prediction[..., :4].shape)
-    '''
-    e.g. pred_boxes[..., 0]:
-    [[image1, 1st box:
-      [[x at (0,0), x at (0,1), x at (0,2), ... x at (0,4)],
-       [x at (1,0), x at (1,1), x at (1,2), ... x at (1,4)],
-       .......
-       [x at (4,0), x at (4,1), x at (4,2), ... x at (4,4)]],
-      image1, 2nd box:
-       .......]]
-    '''
-    pred_boxes[..., 0] = x.data + grid_x
-    pred_boxes[..., 1] = y.data + grid_y
-    pred_boxes[..., 2] = torch.exp(w.data) * anchor_w
-    pred_boxes[..., 3] = torch.exp(h.data) * anchor_h
-
-    #* stride: Resize the detection map to the size of input image
-    output = torch.cat((pred_boxes.view(batch_size, -1, 4) * stride,
-                        pred_conf.view(batch_size, -1, 1),
-                        pred_cls.view(batch_size, -1, num_classes), ), -1,)
-
-    if targets == None:
-        return output, 0
-    else:
-        #Compute loss
-        iou_scores, class_mask, obj_mask, noobj_mask, tx, ty, tw, th, tcls, tconf = build_targets(
-                pred_boxes=pred_boxes,
-                pred_cls=pred_cls,
-                target=targets,
-                anchors=scaled_anchors,
-                ignore_thres=ignore_thres,
-        )
-
-        #Mask outputs to ignore non-existing objects
-        loss_x = nn.MSELoss(x[obj_mask], tx[obj_mask])
-        loss_y = nn.MSELoss(y[obj_mask], ty[obj_mask])
-        loss_w = nn.MSELoss(w[obj_mask], tw[obj_mask])
-        loss_h = nn.MSELoss(h[obj_mask], th[obj_mask])
-        loss_conf_obj = nn.BCELoss(pred_conf[obj_mask], tconf[obj_mask])
-        loss_conf_noobj = nn.BCELoss(pred_conf[noobj_mask], tconf[noobj_mask])
-        loss_conf = loss_conf_obj + 100 * loss_conf_noobj
-        loss_cls = nn.BCELoss(pred_cls[obj_mask], tcls[obj_mask])
-        total_loss = loss_x + loss_y + loss_w + loss_h + loss_conf + loss_cls
-
-        return output, total_loss
 
 def anchor_iou(anchor, wh):
     wh = wh.t()
@@ -311,17 +232,25 @@ def anchor_iou(anchor, wh):
     iou = inter_area / union_area
     return iou
 
-def bbox_iou(box1, box2):
-    #box1, box2 are (1,7) and (n,7) tensors
-    b1_x1, b1_y1, b1_x2, b1_y2 = box1[:,0], box1[:,1], box1[:,2], box1[:,3]
-    #b1_x1... are (1,1) tensors
-    b2_x1, b2_y1, b2_x2, b2_y2 = box2[:,0], box2[:,1], box2[:,2], box2[:,3]
-    #b2_x1... are (n,1) tensors
+def bbox_iou(box1, box2, x1y1x2y2 = True):
+
+    if not x1y1x2y2:
+        #Transform from xywh to x1y1x2y2
+        b1_x1, b1_x2 = box1[:, 0] - box1[:, 2] / 2, box1[:, 0] + box1[:, 2] / 2
+        b1_y1, b1_y2 = box1[:, 1] - box1[:, 3] / 2, box1[:, 1] + box1[:, 3] / 2
+        b2_x1, b2_x2 = box2[:, 0] - box2[:, 2] / 2, box2[:, 0] + box2[:, 2] / 2
+        b2_y1, b2_y2 = box2[:, 1] - box2[:, 3] / 2, box2[:, 1] + box2[:, 3] / 2
+    else:
+        #box1, box2 are (1,7) and (n,7) tensors
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1[:,0], box1[:,1], box1[:,2], box1[:,3]
+        #b1_x1... are (1,1) tensors
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2[:,0], box2[:,1], box2[:,2], box2[:,3]
+        #b2_x1... are (n,1) tensors
 
     inter_x1 = torch.max(b1_x1, b2_x1)
     inter_y1 = torch.max(b1_y1, b2_y1)
     inter_x2 = torch.min(b1_x2, b2_x2)
-    inter_y2 = torch.max(b1_y2, b2_y2)
+    inter_y2 = torch.min(b1_y2, b2_y2)
     #inter_x1... are (n,1) tensors
 
     inter_area = torch.clamp(inter_x2 + 1 - inter_x1, min = 0) * torch.clamp(inter_y2 +1 - inter_y1, min = 0)
@@ -341,7 +270,7 @@ def evaluate(model, path, iou_thres, conf_thres, nms_thres, image_size, batch_si
     model.eval()
 
     dataset = ListDataset(path, image_size = image_size, augment = False)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = False, num_workers = 1, collate_fn = dataset.collate_fn)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size = batch_size, shuffle = False, collate_fn = dataset.collate_fn)
 
     Tensor = torch.cuda.FloatTensor if torch.cuda.is_available() else torch.FloatTensor
 
@@ -358,18 +287,22 @@ def evaluate(model, path, iou_thres, conf_thres, nms_thres, image_size, batch_si
         targets_corner[..., 4] = targets[..., 2] + targets[..., 4] / 2
         targets_corner[..., 5] = targets[..., 3] + targets[..., 5] / 2
         #Rescale target
+        targets[:, 2:] = targets_corner[:, 2:]
         targets[:, 2:] *= image_size
 
         images = Variable(images.type(Tensor), requires_grad = False)
+        targets = Variable(targets.type(Tensor))
 
         with torch.no_grad(): #torch.no_grad(): impacts the autograd engine and deactivate it. It will reduce memory usage and speed up computations.
             outputs = model(images)
-            outputs = write_results(outputs, confidence = conf_thres, num_classes = num_classes, nms_conf = 0.4)
 
-        sample_metrics += get_batch_statistics(outputs, targets, iou_threshold = iou_thres)
+        outputs = write_results(outputs, confidence = conf_thres, num_classes = num_classes, nms_conf = 0.4)
 
-    true_positives, false_negative, pred_scores, pred_labels = [np.concatenate(x, 0) for x in list(zip(*sample_metrics))]
-    precision, recall, AP, f1, ap_class = ap_per_class(true_positives, false_negative, pred_scores, pred_labels, labels)
+        sample_metrics += get_batch_statistics(outputs, targets, iou_thres = iou_thres)
+
+    #true_positives, false_negative, pred_scores, pred_labels = [np.concatenate(x, 0) for x in list(zip(*sample_metrics))]
+    true_pred, pred_scores, pred_labels = [torch.cat(x, 0) for x in list(zip(*sample_metrics))]
+    precision, recall, AP, f1, ap_class = ap_per_class(true_pred, pred_scores, pred_labels, labels)
 
     return precision, recall, AP, f1, ap_class
 
@@ -377,19 +310,22 @@ def get_batch_statistics(outputs, targets, iou_thres):
     #Compute true positive, predicted scores and predicted labels per sample
     #Each row of outputs represent a bounding box: [index of the detected image in the batch, x1, y1, x2, y2, score, max confidence, class with max confidence]
     batch_metrics = []
-    for sample_i in range(outputs[-1, 0]): #Outputs[-1, 0] is the index of the last image in the batch
+
+    for sample_i in range(int(outputs[-1, 0]) + 1): #Outputs[-1, 0] is the index of the last image in the batch
 
         output = outputs[outputs[:, 0] == sample_i][:, 1:]
+        #A row of output: [x1, y1, x2, y2, score, max confidence, class with max confidence]
         if len(output) == 0:
             continue
         pred_boxes = output[..., :4]
         pred_scores = output[..., 4]
-        pred_labels = output[..., 5]
+        pred_labels = output[..., 6]
 
-        true_positives = np.zeros(pred_boxes.shape[0])
+        true_pred = torch.zeros(pred_boxes.shape[0])
         #Each row of target represent a target bounding box: [label, x, y, w, h]
         target = targets[targets[:, 0] == sample_i][:, 1:]
         target_labels = target[:, 0] if len(target) else []
+
         if len(target):
             detected_boxes = []
             target_boxes = target[:, 1:]
@@ -405,28 +341,30 @@ def get_batch_statistics(outputs, targets, iou_thres):
 
                 #box_index: the index of target box with the highest iou with the predicted box
                 iou, box_index = bbox_iou(pred_box.unsqueeze(0), target_boxes).max(0)
+
                 if iou >= iou_thres and box_index not in detected_boxes and pred_label == target_labels[box_index]:
-                        true_pred[box_i] = 1
+                    true_pred[box_i] = 1
 
         batch_metrics.append([true_pred, pred_scores, pred_labels])
 
     return batch_metrics
 
-def ap_per_class(true_pos, false_neg, pred_scores, pred_class, target_class):
+def ap_per_class(true_pred, pred_scores, pred_class, target_class):
     #Compute the average precision of each class
     #Sort the metrics from highest pred_scores to the lowest pred_scores
-    i = np.argsort(-pred_scores)
-    true_pred, pred_scores, pred_class = true_pos[i], false_neg[i], pred_scores[i], pred_class[i]
+    i = torch.argsort(pred_scores, descending = True)
+    true_pred, pred_scores, pred_class = true_pred[i], pred_scores[i], pred_class[i]
 
     #List all the classes appeared in target_class
-    unique_classes = np.unique(trget_class)
+    unique_classes = np.unique(target_class)
 
     #Create Precision-Recall curve and compute AP for each class
     ap, precision, recall = [], [], []
     for c in tqdm.tqdm(unique_classes, desc = 'Computing AP'):
-        i = pred_classes == c #i is the index of predicted bounding boxes with class c
+        i = pred_class == c #i is the index of predicted bounding boxes with class c
         num_targ = (target_class == c).sum() #Number of target boxes with class c
         num_pred = i.sum() #Number of predicted boxes with class c
+
 
         if num_pred == 0 and num_targ == 0:
             continue
@@ -439,11 +377,12 @@ def ap_per_class(true_pos, false_neg, pred_scores, pred_class, target_class):
         else:
             '''
             Accumulate FP and TP
-            .cumsum(): accumulating
-            e.g. [1, 2, 4, 4].cumsum() = [1, 3, 7, 11]
+            cumsum(): accumulating
+            e.g. cumsum([1, 2, 4, 4]) = [1, 3, 7, 11]
             '''
-            false_pred_curv = (1 - true_pred[i]).cumsum()
-            true_pred_curv = (true_pred[i]).cumsum()
+
+            false_pred_curv = torch.cumsum((1 - true_pred[i]), dim = 0)
+            true_pred_curv = torch.cumsum(true_pred[i], dim = 0)
 
             #Recall: ratio of true object detections to the total number of objects in the dataset
             recall_curv = true_pred_curv / (num_targ + 1e-16)
@@ -456,7 +395,7 @@ def ap_per_class(true_pos, false_neg, pred_scores, pred_class, target_class):
             ap.append(compute_ap(recall_curv, precision_curv))
 
     #Compute F1 score
-    precision, recall, ap = np.array(precision), np.array(r), np.array(ap)
+    precision, recall, ap = np.array(precision), np.array(recall), np.array(ap)
     f1 = 2 * precision * recall / (precision + recall + 1e-16)
 
     return precision, recall, ap, f1, unique_classes.astype('int32')
