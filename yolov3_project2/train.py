@@ -2,6 +2,7 @@ from __future__ import division
 from darknet import *
 from util import *
 from terminaltables import AsciiTable
+from PIL import ImageFile
 
 import os
 import sys
@@ -15,6 +16,8 @@ from torchvision import datasets
 from torchvision import transforms
 from torch.autograd import Variable
 import torch.optim as optim
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 def arg_parse():
 
@@ -49,10 +52,17 @@ num_classes = data_cfg['classes']
 
 model = Darknet(args.cfgfile).to(device)
 model.apply(weights_init_normal)
+optimizer = torch.optim.Adam(model.parameters())
 
 if args.pretrained_weights: #If args.pretrained_weights is not empty, return True
     if args.pretrained_weights.endswith('.pth'):
-        model.load_state_dict(torch.load(args.pretrained_weights))
+        checkpoint = torch.load(args.pretrained_weights)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        epoch = checkpoint['epoch']
+        print('epoch:', epoch)
+        loss = checkpoint['loss']
+
     else:
         model.load_weights(args.pretrained_weights)
 
@@ -60,10 +70,12 @@ dataset = ListDataset(train_path, augment = True)
 #dataset: training images and targets
 dataloader = torch.utils.data.DataLoader(dataset, batch_size = args.batch_size, shuffle = True, pin_memory = True, collate_fn = dataset.collate_fn, )
 #pin_memory = True: put the fetched data tensors in pinned memory and thus enables faster data transfer to CUDA-enabled GPUs
-optimizer = torch.optim.Adam(model.parameters())
+
 
 metrics = ['grid_size', 'loss', 'x', 'y', 'w', 'h', 'conf', 'cls', 'cls_acc',
            'recall50', 'recall75', 'precision', 'conf_obj', 'conf_noobj', ]
+
+mAP = 0.0
 
 for epoch in range(args.epochs):
     print('Start training, epoch', epoch)
@@ -87,6 +99,7 @@ for epoch in range(args.epochs):
         #Log process
         log_str = '\n---- [Epoch %d/%d, Batch %d/%d] ----\n' % (epoch, args.epochs, i, len(dataloader))
         log_str += f'\nTotal loss {loss.item()}'
+        log_str += f'\nLast mAP: {mAP}'
 
         #Approximate time left for epoch
         epoch_batches_left = len(dataloader) - (i + 1)
@@ -95,7 +108,7 @@ for epoch in range(args.epochs):
 
         print(log_str)
 
-        model.seen += images.size(0) #model.seen: training pictures number
+        #model.seen += images.size(0) #model.seen: training pictures number
 
     if epoch % args.evaluation_interval == 0:
         print('\n---- Evaluating Model ----')
@@ -107,8 +120,13 @@ for epoch in range(args.epochs):
         ap_table = [['Index', 'Class name', 'AP']]
         for i, c in enumerate(ap_class):
             ap_table += [[c, classes[c], '%.5f' % AP[i]]]
+        mAP = AP.mean()
         print(AsciiTable(ap_table).table)
-        print(f'---- mAP {AP.mean()}')
+        print(f'---- mAP {mAP}')
 
     if epoch % args.checkpoint_interval == 0:
-            torch.save(model.state_dict(), f"checkpoints/yolov3_ckpt_%d.pth" % epoch)
+        torch.save({'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': loss},
+                    f"checkpoints/yolov3_ckpt_%d.pth" % epoch)

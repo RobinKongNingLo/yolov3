@@ -313,37 +313,41 @@ def get_batch_statistics(outputs, targets, iou_thres):
 
     for sample_i in range(int(outputs[-1, 0]) + 1): #Outputs[-1, 0] is the index of the last image in the batch
 
-        output = outputs[outputs[:, 0] == sample_i][:, 1:]
-        #A row of output: [x1, y1, x2, y2, score, max confidence, class with max confidence]
-        if len(output) == 0:
+        try:
+            #A row of output: [x1, y1, x2, y2, score, max confidence, class with max confidence]
+            output = outputs[outputs[:, 0] == sample_i][:, 1:]
+        except:
             continue
+
         pred_boxes = output[..., :4]
         pred_scores = output[..., 4]
         pred_labels = output[..., 6]
 
         true_pred = torch.zeros(pred_boxes.shape[0])
-        #Each row of target represent a target bounding box: [label, x, y, w, h]
-        target = targets[targets[:, 0] == sample_i][:, 1:]
-        target_labels = target[:, 0] if len(target) else []
+        try:
+            #Each row of target represent a target bounding box: [label, x, y, w, h]
+            target = targets[targets[:, 0] == sample_i][:, 1:]
+            target_labels = target[:, 0] if len(target) else []
+        except:
+            continue
 
-        if len(target):
-            detected_boxes = []
-            target_boxes = target[:, 1:]
+        detected_boxes = []
+        target_boxes = target[:, 1:]
 
-            for box_i, (pred_box, pred_label) in enumerate(zip(pred_boxes, pred_labels)):
+        for box_i, (pred_box, pred_label) in enumerate(zip(pred_boxes, pred_labels)):
 
-                if len(detected_boxes) == len(target):
-                    break
+            if len(detected_boxes) == len(target):
+                break
 
-                #Ignore if label is not one of the target labels
-                if pred_label not in target_labels:
-                    continue
+            #Ignore if label is not one of the target labels
+            if pred_label not in target_labels:
+                continue
 
-                #box_index: the index of target box with the highest iou with the predicted box
-                iou, box_index = bbox_iou(pred_box.unsqueeze(0), target_boxes).max(0)
+            #box_index: the index of target box with the highest iou with the predicted box
+            iou, box_index = bbox_iou(pred_box.unsqueeze(0), target_boxes).max(0)
 
-                if iou >= iou_thres and box_index not in detected_boxes and pred_label == target_labels[box_index]:
-                    true_pred[box_i] = 1
+            if iou >= iou_thres and box_index not in detected_boxes and pred_label == target_labels[box_index]:
+                true_pred[box_i] = 1
 
         batch_metrics.append([true_pred, pred_scores, pred_labels])
 
